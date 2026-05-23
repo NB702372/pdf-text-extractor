@@ -1,4 +1,5 @@
 import io
+from pathlib import Path
 
 import fitz
 import numpy as np
@@ -8,6 +9,7 @@ from streamlit_drawable_canvas import st_canvas
 
 ZOOM = 2.0
 MAX_CANVAS_WIDTH = 900
+MODELS_DIR = Path(__file__).parent / "models"
 
 
 def _reflow_items(items):
@@ -85,11 +87,22 @@ def ocr_extract(image, reader, reflow=True):
     return "\n".join(it["text"] for it in items)
 
 
-@st.cache_resource(show_spinner="OCRモデル(日本語)を読み込み中... (初回はモデルをダウンロード)")
+@st.cache_resource(show_spinner="OCRモデル(日本語)を読み込み中...")
 def get_ocr_reader():
     from rapidocr import RapidOCR, LangRec
 
-    return RapidOCR(params={"Rec.lang_type": LangRec.JAPAN})
+    params = {"Rec.lang_type": LangRec.JAPAN}
+    # バンドル済みモデルがあればそれを使う (クラウド環境でDL不可のため)
+    det = MODELS_DIR / "ch_PP-OCRv4_det_mobile.onnx"
+    cls = MODELS_DIR / "ch_ppocr_mobile_v2.0_cls_mobile.onnx"
+    rec = MODELS_DIR / "japan_PP-OCRv4_rec_mobile.onnx"
+    if det.exists():
+        params["Det.model_path"] = str(det)
+    if cls.exists():
+        params["Cls.model_path"] = str(cls)
+    if rec.exists():
+        params["Rec.model_path"] = str(rec)
+    return RapidOCR(params=params)
 
 
 def parse_pages(spec: str, num_pages: int) -> list[int]:
