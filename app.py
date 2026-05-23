@@ -92,8 +92,44 @@ def get_ocr_reader():
     return RapidOCR(params={"Rec.lang_type": LangRec.JAPAN})
 
 
-def page_has_text(page):
-    return bool(page.get_text("text").strip())
+def parse_pages(spec: str, num_pages: int) -> list[int]:
+    """'1-3, 5, 7-9' のような指定文字列を 0始まりのページindexリストに変換する。
+    'all' または '*' は全ページ。
+    """
+    spec = (spec or "").strip().lower()
+    if not spec or spec in ("all", "*", "全て", "すべて"):
+        return list(range(num_pages))
+    result = set()
+    for part in spec.replace("、", ",").replace(" ", "").split(","):
+        if not part:
+            continue
+        if "-" in part or "~" in part or "〜" in part:
+            tokens = part.replace("~", "-").replace("〜", "-").split("-", 1)
+            try:
+                start = int(tokens[0])
+                end = int(tokens[1])
+            except (ValueError, IndexError):
+                raise ValueError(f"範囲指定が不正です: '{part}'")
+            if start < 1 or end > num_pages or start > end:
+                raise ValueError(
+                    f"範囲 '{part}' は 1〜{num_pages} の間で start ≦ end になるよう指定してください"
+                )
+            for p in range(start, end + 1):
+                result.add(p - 1)
+        else:
+            try:
+                p = int(part)
+            except ValueError:
+                raise ValueError(f"数値が不正です: '{part}'")
+            if p < 1 or p > num_pages:
+                raise ValueError(f"ページ {p} は 1〜{num_pages} の範囲外です")
+            result.add(p - 1)
+    return sorted(result)
+
+
+def render_page_image(page):
+    pix = page.get_pixmap(matrix=fitz.Matrix(ZOOM, ZOOM))
+    return Image.open(io.BytesIO(pix.tobytes("png")))
 
 
 st.set_page_config(page_title="PDF テキスト抽出ツール", layout="wide")
@@ -114,9 +150,23 @@ col_settings, col_result = st.columns([1.3, 1])
 
 with col_settings:
     st.subheader("設定")
-    page_num = st.number_input(
-        "ページ番号", min_value=1, max_value=num_pages, value=1, step=1
+    page_spec = st.text_input(
+        f"ページ範囲 (全{num_pages}ページ)",
+        value="1",
+        help="例: 1 / 1-3 / 1,3,5 / 1-3,5,7-9 / all (全ページ)",
+        placeholder="1-3, 5, 7-9",
     )
+    try:
+        page_indices = parse_pages(page_spec, num_pages)
+    except ValueError as e:
+        st.error(f"ページ指定エラー: {e}")
+        st.stop()
+    if not page_indices:
+        st.warning("ページを1つ以上指定してください。")
+        st.stop()
+    if len(page_indices) > 1:
+        st.caption(f"対象: {len(page_indices)} ページ (ページ {', '.join(str(i + 1) for i in page_indices)})")
+
     mode = st.radio(
         "抽出モード",
         ["ページ全体", "範囲選択 (マウスでドラッグ)"],
@@ -134,15 +184,9 @@ with col_settings:
         help="字間が広く取られた『春 学 期』のような表記を『春学期』として1行に結合します。",
     )
 
-page = doc[page_num - 1]
 
-mat = fitz.Matrix(ZOOM, ZOOM)
-pix = page.get_pixmap(matrix=mat)
-page_img = Image.open(io.BytesIO(pix.tobytes("png")))
-
-
-def extract_text(clip=None, image=None):
-    """clip: fitz.Rect (PDF座標), image: PIL Image (clip適用済み)。"""
+def extract_for(page, image, clip=None):
+    """指定ページについてテキスト抽出を行い、(text, used_method) を返す。"""
     used = None
     text = ""
     if extract_method in ("自動 (推奨)", "テキスト抽出のみ"):
@@ -155,29 +199,62 @@ def extract_text(clip=None, image=None):
     if extract_method == "OCR (スキャン画像PDF用)" or (
         extract_method == "自動 (推奨)" and not text.strip()
     ):
-        if image is None:
-            image = page_img
         reader = get_ocr_reader()
         text = ocr_extract(image, reader, reflow=use_smart)
         used = "ocr"
     return text, used
 
 
+def page_header(idx):
+    return f"===== ページ {idx + 1} ====="
+
+
+# 先頭の対象ページを「プレビュー」用に使う
+preview_idx = page_indices[0]
+preview_page = doc[preview_idx]
+preview_img = render_page_image(preview_page)
+
+extracted_text = ""
+used_methods = set()
+
 if mode == "ページ全体":
-    extracted_text, used_method = extract_text(image=page_img)
+    parts = []
+    progress = None
+    if len(page_indices) > 3:
+        progress = st.progress(0, text="抽出中...")
+    for n, idx in enumerate(page_indices):
+        pg = doc[idx]
+        img = preview_img if idx == preview_idx else render_page_image(pg)
+        t, m = extract_for(pg, img)
+        if m:
+            used_methods.add(m)
+        if t.strip():
+            block = t.rstrip()
+            if len(page_indices) > 1:
+                block = f"{page_header(idx)}\n{block}"
+            parts.append(block)
+        if progress:
+            progress.progress((n + 1) / len(page_indices), text=f"抽出中... {n + 1}/{len(page_indices)}")
+    if progress:
+        progress.empty()
+    extracted_text = "\n\n".join(parts)
 
     with col_settings:
-        st.subheader("プレビュー")
-        st.image(page_img, use_column_width=True)
+        st.subheader(f"プレビュー (ページ {preview_idx + 1})")
+        if len(page_indices) > 1:
+            st.caption("※ プレビューは最初の対象ページのみ表示。抽出は指定した全ページを対象に実行されます。")
+        st.image(preview_img, use_column_width=True)
 
 else:
-    scale = min(1.0, MAX_CANVAS_WIDTH / page_img.width)
-    canvas_w = int(page_img.width * scale)
-    canvas_h = int(page_img.height * scale)
-    bg_img = page_img.resize((canvas_w, canvas_h))
+    scale = min(1.0, MAX_CANVAS_WIDTH / preview_img.width)
+    canvas_w = int(preview_img.width * scale)
+    canvas_h = int(preview_img.height * scale)
+    bg_img = preview_img.resize((canvas_w, canvas_h))
 
     with col_settings:
-        st.markdown("**PDFページ上でドラッグして範囲を選択**")
+        st.markdown(f"**プレビュー (ページ {preview_idx + 1}) 上でドラッグして範囲を選択**")
+        if len(page_indices) > 1:
+            st.caption(f"※ 描いた矩形と同じ座標を、指定した {len(page_indices)} ページ全てに適用します。")
         canvas_result = st_canvas(
             fill_color="rgba(255, 165, 0, 0.2)",
             stroke_width=2,
@@ -187,11 +264,9 @@ else:
             height=canvas_h,
             width=canvas_w,
             drawing_mode="rect",
-            key=f"canvas_p{page_num}",
+            key=f"canvas_p{preview_idx}",
         )
 
-    extracted_text = ""
-    used_method = None
     rects = []
     if canvas_result.json_data and canvas_result.json_data.get("objects"):
         for obj in canvas_result.json_data["objects"]:
@@ -217,28 +292,59 @@ else:
 
     if rects:
         parts = []
-        methods = set()
-        for pdf_rect, img_rect in rects:
-            cropped_img = page_img.crop(img_rect)
-            t, m = extract_text(clip=pdf_rect, image=cropped_img)
-            if t.strip():
-                parts.append(t.rstrip())
+        progress = None
+        if len(page_indices) > 3:
+            progress = st.progress(0, text="抽出中...")
+        for n, idx in enumerate(page_indices):
+            pg = doc[idx]
+            img = preview_img if idx == preview_idx else render_page_image(pg)
+            page_parts = []
+            for r_no, (pdf_rect, img_rect) in enumerate(rects, 1):
+                cropped = img.crop(img_rect)
+                t, m = extract_for(pg, cropped, clip=pdf_rect)
                 if m:
-                    methods.add(m)
-        extracted_text = "\n--- 次の範囲 ---\n".join(parts)
-        if len(methods) == 1:
-            used_method = methods.pop()
-        elif methods:
-            used_method = "mixed"
+                    used_methods.add(m)
+                if t.strip():
+                    label = f"[矩形{r_no}] " if len(rects) > 1 else ""
+                    page_parts.append(f"{label}{t.rstrip()}")
+            if page_parts:
+                page_block = "\n--- 次の範囲 ---\n".join(page_parts) if len(rects) > 1 else page_parts[0]
+                if len(page_indices) > 1:
+                    page_block = f"{page_header(idx)}\n{page_block}"
+                parts.append(page_block)
+            if progress:
+                progress.progress((n + 1) / len(page_indices), text=f"抽出中... {n + 1}/{len(page_indices)}")
+        if progress:
+            progress.empty()
+        extracted_text = "\n\n".join(parts)
+
+
+# 出力方法のキャプション用
+if len(used_methods) == 1:
+    used_label = used_methods.pop()
+elif len(used_methods) > 1:
+    used_label = "mixed"
+else:
+    used_label = None
+
+
+def build_download_name():
+    base = uploaded_file.name.rsplit(".", 1)[0]
+    if len(page_indices) == 1:
+        return f"{base}_p{page_indices[0] + 1}.txt"
+    if page_indices == list(range(page_indices[0], page_indices[-1] + 1)):
+        return f"{base}_p{page_indices[0] + 1}-{page_indices[-1] + 1}.txt"
+    return f"{base}_pages.txt"
+
 
 with col_result:
     st.subheader("抽出結果")
     if extracted_text:
-        if used_method == "ocr":
+        if used_label == "ocr":
             st.caption("使用方法: OCR (画像認識)")
-        elif used_method == "text":
+        elif used_label == "text":
             st.caption("使用方法: PDFのテキスト抽出")
-        elif used_method == "mixed":
+        elif used_label == "mixed":
             st.caption("使用方法: テキスト抽出とOCRの併用")
         st.text_area(
             "テキスト",
@@ -249,10 +355,14 @@ with col_result:
         st.download_button(
             "テキストファイルとしてダウンロード",
             data=extracted_text.encode("utf-8"),
-            file_name=f"{uploaded_file.name.rsplit('.', 1)[0]}_p{page_num}.txt",
+            file_name=build_download_name(),
             mime="text/plain",
         )
-        st.metric("文字数", len(extracted_text))
+        c1, c2 = st.columns(2)
+        with c1:
+            st.metric("文字数", len(extracted_text))
+        with c2:
+            st.metric("対象ページ数", len(page_indices))
     else:
         if mode == "範囲選択 (マウスでドラッグ)":
             st.info("左側のPDFプレビュー上でマウスをドラッグして範囲を指定してください。複数の矩形を選択することもできます。")
