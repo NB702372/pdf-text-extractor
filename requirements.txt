@@ -1,0 +1,7 @@
+streamlit>=1.30
+pymupdf>=1.23
+pillow>=10.0
+streamlit-drawable-canvas>=0.9.3
+numpy<2
+rapidocr>=3.0
+onnxruntime==1.17.0
