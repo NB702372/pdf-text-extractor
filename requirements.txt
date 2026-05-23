@@ -3,5 +3,6 @@ pymupdf
 pillow
 streamlit-drawable-canvas
 numpy
+opencv-python-headless
 rapidocr
 onnxruntime
